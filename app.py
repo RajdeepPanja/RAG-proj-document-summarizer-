@@ -1,5 +1,7 @@
 import os
+import shutil
 import tempfile
+import uuid
 import streamlit as st
 
 from dotenv import load_dotenv
@@ -14,7 +16,15 @@ from langchain_core.prompts import ChatPromptTemplate
 # ----------------------------
 # Config
 # ----------------------------
-PERSIST_DIR = "chroma_db"
+# Each uploaded book gets its own subfolder under this root, e.g.
+# chroma_db/session_ab12cd34/. We never delete a subfolder that Chroma
+# still has open in this process — on Windows that raises WinError 32
+# because the index files are memory-mapped and stay locked until the
+# Python object holding them is fully released. Instead we just point
+# "active" at a new folder and best-effort clean up old ones on the
+# NEXT app start, once the previous process (and its file locks) is gone.
+PERSIST_ROOT = "chroma_db"
+ACTIVE_POINTER = os.path.join(PERSIST_ROOT, "active.txt")
 
 st.set_page_config(page_title="The Archive · Chat with your book", page_icon="📖", layout="wide")
 
@@ -267,8 +277,41 @@ def get_llm():
     return ChatMistralAI(model="mistral-small-2603")
 
 
-def build_vectorstore_from_pdf(pdf_path: str, persist_directory: str):
-    """Load a PDF, chunk it, embed it, and persist it to Chroma."""
+def _read_active_dir():
+    if os.path.isfile(ACTIVE_POINTER):
+        with open(ACTIVE_POINTER, "r") as f:
+            name = f.read().strip()
+        full_path = os.path.join(PERSIST_ROOT, name)
+        if name and os.path.isdir(full_path):
+            return full_path
+    return None
+
+
+def _write_active_dir(full_path: str):
+    os.makedirs(PERSIST_ROOT, exist_ok=True)
+    with open(ACTIVE_POINTER, "w") as f:
+        f.write(os.path.basename(full_path))
+
+
+def cleanup_orphaned_dirs():
+    """Best-effort delete of database folders left over from previous
+    uploads/deletes. Safe to run at app start, before any Chroma client
+    in THIS process has opened anything, so nothing here is locked."""
+    if not os.path.isdir(PERSIST_ROOT):
+        return
+    active = _read_active_dir()
+    for name in os.listdir(PERSIST_ROOT):
+        full_path = os.path.join(PERSIST_ROOT, name)
+        if not os.path.isdir(full_path):
+            continue
+        if active and os.path.samefile(full_path, active):
+            continue
+        shutil.rmtree(full_path, ignore_errors=True)
+
+
+def build_vectorstore_from_pdf(pdf_path: str, persist_root: str):
+    """Load a PDF, chunk it, embed it, and persist it to a brand-new
+    Chroma folder (never reused), then mark that folder as active."""
     loader = PyPDFLoader(pdf_path)
     docs = loader.load()
 
@@ -282,11 +325,13 @@ def build_vectorstore_from_pdf(pdf_path: str, persist_directory: str):
 
     embedding_model = get_embedding_model()
 
+    new_dir = os.path.join(persist_root, f"session_{uuid.uuid4().hex[:12]}")
     vectorstore = Chroma.from_documents(
         documents=chunks,
         embedding=embedding_model,
-        persist_directory=persist_directory,
+        persist_directory=new_dir,
     )
+    _write_active_dir(new_dir)
     return vectorstore, len(chunks)
 
 
@@ -325,13 +370,22 @@ if "vectorstore" not in st.session_state:
 if "book_name" not in st.session_state:
     st.session_state.book_name = None
 
-# If a database already exists on disk from a previous run, offer to load it
-if st.session_state.vectorstore is None and os.path.isdir(PERSIST_DIR) and os.listdir(PERSIST_DIR):
-    try:
-        st.session_state.vectorstore = load_existing_vectorstore(PERSIST_DIR)
-        st.session_state.book_name = "Previously archived volume"
-    except Exception:
-        pass
+# Clean up folders left behind by previous uploads/deletes now, at process
+# start — this is the safe moment to do it, since this process hasn't
+# opened any Chroma folder yet, so nothing can be locked.
+if "cleanup_done" not in st.session_state:
+    cleanup_orphaned_dirs()
+    st.session_state.cleanup_done = True
+
+# If a database already exists on disk from a previous run, load it
+if st.session_state.vectorstore is None:
+    active_dir = _read_active_dir()
+    if active_dir:
+        try:
+            st.session_state.vectorstore = load_existing_vectorstore(active_dir)
+            st.session_state.book_name = "Previously archived volume"
+        except Exception:
+            pass
 
 # ----------------------------
 # Sidebar: upload & process book
@@ -351,7 +405,7 @@ with st.sidebar:
 
                 try:
                     vectorstore, num_chunks = build_vectorstore_from_pdf(
-                        tmp_path, PERSIST_DIR
+                        tmp_path, PERSIST_ROOT
                     )
                     st.session_state.vectorstore = vectorstore
                     st.session_state.book_name = uploaded_file.name
@@ -379,6 +433,15 @@ with st.sidebar:
         st.write("")
         if st.button("🗞️  Clear conversation", use_container_width=True):
             st.session_state.messages = []
+            st.rerun()
+
+        if st.button("🗑️  Delete book & database", use_container_width=True):
+            st.session_state.vectorstore = None
+            st.session_state.book_name = None
+            st.session_state.messages = []
+            if os.path.isfile(ACTIVE_POINTER):
+                os.remove(ACTIVE_POINTER)
+            st.info("Deleted. Restart the app to fully free the files on disk.")
             st.rerun()
 
 # ----------------------------
