@@ -23,7 +23,7 @@ from langchain_core.prompts import ChatPromptTemplate
 # Python object holding them is fully released. Instead we just point
 # "active" at a new folder and best-effort clean up old ones on the
 # NEXT app start, once the previous process (and its file locks) is gone.
-PERSIST_ROOT = "chroma_db"
+PERSIST_ROOT = os.path.join(tempfile.gettempdir(), "the_archive_chroma_db")
 ACTIVE_POINTER = os.path.join(PERSIST_ROOT, "active.txt")
 
 st.set_page_config(page_title="The Archive · Chat with your book", page_icon="📖", layout="wide")
@@ -297,16 +297,20 @@ def cleanup_orphaned_dirs():
     """Best-effort delete of database folders left over from previous
     uploads/deletes. Safe to run at app start, before any Chroma client
     in THIS process has opened anything, so nothing here is locked."""
-    if not os.path.isdir(PERSIST_ROOT):
-        return
-    active = _read_active_dir()
-    for name in os.listdir(PERSIST_ROOT):
-        full_path = os.path.join(PERSIST_ROOT, name)
-        if not os.path.isdir(full_path):
-            continue
-        if active and os.path.samefile(full_path, active):
-            continue
-        shutil.rmtree(full_path, ignore_errors=True)
+    try:
+        if not os.path.isdir(PERSIST_ROOT):
+            return
+        active = _read_active_dir()
+        for name in os.listdir(PERSIST_ROOT):
+            full_path = os.path.join(PERSIST_ROOT, name)
+            if not os.path.isdir(full_path):
+                continue
+            if active and os.path.samefile(full_path, active):
+                continue
+            shutil.rmtree(full_path, ignore_errors=True)
+    except Exception:
+        # Cleanup is best-effort only — never let it block the app.
+        pass
 
 
 def build_vectorstore_from_pdf(pdf_path: str, persist_root: str):
@@ -326,12 +330,29 @@ def build_vectorstore_from_pdf(pdf_path: str, persist_root: str):
     embedding_model = get_embedding_model()
 
     new_dir = os.path.join(persist_root, f"session_{uuid.uuid4().hex[:12]}")
-    vectorstore = Chroma.from_documents(
-        documents=chunks,
-        embedding=embedding_model,
-        persist_directory=new_dir,
-    )
-    _write_active_dir(new_dir)
+    try:
+        vectorstore = Chroma.from_documents(
+            documents=chunks,
+            embedding=embedding_model,
+            persist_directory=new_dir,
+        )
+        _write_active_dir(new_dir)
+    except Exception as disk_error:
+        # Some hosting platforms (e.g. certain container filesystems) block
+        # writes to the persisted SQLite file even though the directory
+        # itself looks writable. Fall back to an in-memory database so the
+        # app still works for this session — it just won't survive a
+        # restart, which on most free hosting platforms wouldn't have
+        # persisted anyway.
+        st.warning(
+            "Couldn't write a persistent database on this host, so this "
+            "session is using an in-memory database instead. Chat will "
+            "still work, but the book won't be remembered after a restart."
+        )
+        vectorstore = Chroma.from_documents(
+            documents=chunks,
+            embedding=embedding_model,
+        )
     return vectorstore, len(chunks)
 
 
