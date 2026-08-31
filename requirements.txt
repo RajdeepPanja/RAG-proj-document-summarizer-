@@ -3,15 +3,12 @@ langchain-community
 langchain-core
 langchain-mistralai
 mistralai
-
 langchain-huggingface
+langchain-text-splitters
+chromadb
 sentence-transformers
-
 faiss-cpu
-
 python-dotenv
-
 pypdf
 docx2txt
-
 streamlit
